@@ -1,0 +1,7 @@
+# 凭据绝不入库（云端用 GitHub Secrets 提供）
+config.json
+*.bak
+
+__pycache__/
+*.pyc
+.venv/
