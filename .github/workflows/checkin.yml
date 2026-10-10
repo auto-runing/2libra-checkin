@@ -20,6 +20,10 @@ name: 2Libra 每日签到
 #      北京 12:00 -> "0 4 * * *"       北京 20:00 -> "0 12 * * *"
 #
 #  改了基准时间，务必同步改 schedule.json 的 base_time（不一致时日志会告警）。
+#
+#  ⚠️ Cloudflare：2libra 挂在 Cloudflare 后面，机房 IP 会被弹「Just a moment...」。
+#     下面「安装指纹依赖」步骤提供的 curl_cffi 会用真实 Chrome 的 TLS/HTTP2 指纹，
+#     这是能否在 Actions 里签到成功的关键；装不上时脚本会退回标准库并被拦截（退出码 3）。
 # ===========================================================================
 
 on:
@@ -29,6 +33,12 @@ on:
     - cron: "5,15,25,35,45,55 0-3 * * *"
   # 网页 / 手机 GitHub App 手动点一下即可立即签到（不参与抽签）
   workflow_dispatch:
+  # 临时：推送改动即自动跑一次，便于验证修复效果（验证完会移除）
+  push:
+    paths:
+      - "checkin.py"
+      - "schedule.json"
+      - ".github/workflows/checkin.yml"
 
 permissions:
   contents: write
@@ -46,6 +56,20 @@ jobs:
       - name: 拉取仓库
         uses: actions/checkout@v4
 
+      - name: 缓存指纹依赖
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-curl-cffi-${{ runner.os }}-v1
+
+      - name: 安装指纹依赖（curl_cffi：真实 Chrome 的 TLS/HTTP2 指纹）
+        continue-on-error: true
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet --disable-pip-version-check curl_cffi
+          .venv/bin/python -c "import curl_cffi; print('curl_cffi 就绪:', curl_cffi.__version__)" \
+            || echo "!! curl_cffi 不可用，将退回标准库 urllib（机房 IP 上大概率被 Cloudflare 拦）"
+
       - name: 执行签到（按抽签结果决定是否执行）
         env:
           TWOLIBRA_TOKEN: ${{ secrets.TWOLIBRA_TOKEN }}
@@ -57,8 +81,13 @@ jobs:
           # 想不改文件就调整随机区间，可解开下面两行（单位：分钟）
           # TWOLIBRA_DELAY_MIN: "0"
           # TWOLIBRA_DELAY_MAX: "60"
-        # 脚本是纯标准库，直接用 runner 自带的 python3，省掉 setup-python 的时间
-        run: python3 checkin.py --notify
+        run: |
+          PY=".venv/bin/python"
+          if [ ! -x "$PY" ]; then
+            echo "!! 指纹依赖不可用，改用系统 python3 —— 请注意可能被 Cloudflare 拦截"
+            PY=python3
+          fi
+          $PY checkin.py --notify
 
       - name: 保活心跳（有签到记录时才提交，规避 60 天无提交被自动禁用）
         if: always()

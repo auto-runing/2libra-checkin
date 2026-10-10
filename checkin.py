@@ -44,7 +44,14 @@
     PUSHPLUS_TOKEN  PushPlus（微信推送）
     GITHUB_STEP_SUMMARY  GitHub Actions 自动注入，会把结果写进任务摘要
 
-退出码：0 成功 / 1 运行异常 / 2 凭据失效(需重新获取 token)
+退出码：0 成功 / 1 运行异常 / 2 凭据失效(需重新获取 token) / 3 被 Cloudflare 拦截
+
+依赖（可选但强烈建议）：
+    curl_cffi —— 装上后所有请求都带 Chrome 的 TLS/JA3、HTTP/2 与请求头指纹，
+    这是穿过 Cloudflare 机器人挑战的关键；未安装时退回标准库 urllib，
+    在 GitHub Actions 这类机房 IP 上会被 Cloudflare 弹「Just a moment...」拦下。
+        pip install curl_cffi
+    可用环境变量 TWOLIBRA_IMPERSONATE 指定指纹版本（默认 chrome），设为空串则关闭模拟。
 """
 
 import argparse
@@ -59,6 +66,17 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+
+# 2libra 挂在 Cloudflare 后面。它会按「UA 说是 Chrome、TLS 指纹却是 Python」判定为
+# 机器人并回挑战页（Just a moment...）。装了 curl_cffi 就走它的 Chrome 指纹模拟
+# （TLS/JA3、HTTP/2、请求头顺序与真实浏览器一致）；没装则退回标准库 urllib，
+# 此时在机房 IP 上极易被拦。
+try:
+    from curl_cffi import requests as cffi_requests
+    HAS_CURL_CFFI = True
+except Exception:
+    cffi_requests = None
+    HAS_CURL_CFFI = False
 
 BASE = "https://2libra.com"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -90,6 +108,14 @@ USER_AGENT = (
 
 DEBUG = False
 
+# curl_cffi 的浏览器指纹版本；可用 TWOLIBRA_IMPERSONATE 覆盖，设为空串则关闭模拟
+IMPERSONATE = os.environ.get("TWOLIBRA_IMPERSONATE", "chrome").strip()
+
+# Cloudflare 挑战页特征：命中说明请求根本没能进入业务接口
+CF_MARKERS = ("just a moment", "cf-chl", "cf_chl_opt", "_cf_chl",
+              "attention required", "enable javascript and cookies",
+              "checking your browser")
+
 try:
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -99,6 +125,34 @@ except Exception:
 
 class Unauthorized(Exception):
     """凭据失效，需要重新抓取 token。"""
+
+
+class CloudflareBlocked(Exception):
+    """被 Cloudflare 的机器人挑战拦住，请求没真正到达接口。"""
+
+    def __init__(self, status, snippet=""):
+        super().__init__("Cloudflare 拦截 HTTP %s" % status)
+        self.status = status
+        self.snippet = snippet
+
+
+def http_backend():
+    """当前使用的 HTTP 客户端（用于日志诊断）。"""
+    if HAS_CURL_CFFI:
+        return "curl_cffi（impersonate=%s）" % (IMPERSONATE or "已关闭")
+    return "urllib 标准库（无浏览器指纹，机房 IP 易被拦）"
+
+
+def is_cf_challenge(status, raw):
+    """判断响应是否为 Cloudflare 挑战页（而非接口 JSON）。"""
+    if not raw:
+        return False
+    low = raw[:6000].lower()
+    if not ("<html" in low or "<!doctype" in low or "cloudflare" in low):
+        return False
+    if any(m in low for m in CF_MARKERS):
+        return True
+    return status in (403, 429, 503) and "cloudflare" in low
 
 
 def now_str():
@@ -168,6 +222,36 @@ def parse_json(raw):
         return {"c": -1, "m": raw[:300], "d": None}
 
 
+def _do_http(method, url, headers, data, timeout):
+    """发一次请求，返回 (status, text)。优先 curl_cffi 的浏览器指纹，失败退回 urllib。"""
+    global IMPERSONATE
+    if HAS_CURL_CFFI:
+        h = dict(headers)
+        if IMPERSONATE:
+            # 交给 impersonate 提供与 TLS 指纹匹配的 UA，避免「UA 与指纹不符」被判定机器人
+            h.pop("user-agent", None)
+        try:
+            r = cffi_requests.request(method, url, headers=h, data=data,
+                                      timeout=timeout, impersonate=IMPERSONATE or None,
+                                      allow_redirects=True)
+        except Exception as e:
+            if IMPERSONATE and "impersonate" in str(e).lower():
+                print("[指纹] curl_cffi 不支持 impersonate=%s（%s），退回默认指纹。" % (IMPERSONATE, e))
+                IMPERSONATE = ""
+                h.pop("user-agent", None)
+                h["user-agent"] = headers.get("user-agent", "")
+                r = cffi_requests.request(method, url, headers=h, data=data,
+                                          timeout=timeout, allow_redirects=True)
+            else:
+                raise
+        return r.status_code, r.text
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=timeout,
+                               context=ssl.create_default_context()) as resp:
+        return resp.status, resp.read().decode("utf-8", "replace")
+
+
 def request(cfg, method, path, body=None, tries=3, timeout=15):
     """返回 (http_status, json_body)。HTTP 4xx 不抛异常，交给上层判断。"""
     url = BASE + path
@@ -177,19 +261,23 @@ def request(cfg, method, path, body=None, tries=3, timeout=15):
         data = json.dumps(body).encode("utf-8")
         headers["content-type"] = "application/json"
 
-    ctx = ssl.create_default_context()
     last_err = None
     for attempt in range(1, tries + 1):
         try:
-            req = urllib.request.Request(url, data=data, headers=headers, method=method)
-            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-                raw = resp.read().decode("utf-8", "replace")
-                out = (resp.status, parse_json(raw))
-                if DEBUG:
-                    print("[debug] %s %s -> %s %s" % (method, path, out[0], json.dumps(out[1], ensure_ascii=False)[:1500]))
-                return out
+            status, raw = _do_http(method, url, headers, data, timeout)
+            if is_cf_challenge(status, raw):
+                # 挑战页靠重试解决不了（同一出口 IP 会持续被挑战），立即上抛
+                raise CloudflareBlocked(status, raw[:300])
+            out = (status, parse_json(raw))
+            if DEBUG:
+                print("[debug] %s %s -> %s %s" % (method, path, out[0], json.dumps(out[1], ensure_ascii=False)[:1500]))
+            return out
+        except CloudflareBlocked:
+            raise
         except urllib.error.HTTPError as e:
             raw = e.read().decode("utf-8", "replace")
+            if is_cf_challenge(e.code, raw):
+                raise CloudflareBlocked(e.code, raw[:300])
             out = (e.code, parse_json(raw))
             if DEBUG:
                 print("[debug] %s %s -> %s %s" % (method, path, out[0], json.dumps(out[1], ensure_ascii=False)[:1500]))
@@ -391,6 +479,7 @@ def print_plan(sched, now_bj, target_at, delay, how, check_only, slotting):
              "当前时间  : 北京 %s（UTC %s）" % (now_bj.strftime("%Y-%m-%d %H:%M:%S"),
                                              (now_bj - datetime.timedelta(hours=8)).strftime("%m-%d %H:%M:%S")),
              "调度模式  : " + mode_label,
+             "HTTP 指纹 : " + http_backend(),
              "基准时间  : %s（北京时间）" % (sched.get("base_time") or "-")]
     cron = (os.environ.get("SCHEDULED_CRON") or "").strip()
     if cron:
@@ -732,6 +821,8 @@ def main():
             print("[计划] 凭据预检通过，token 有效。")
         except Unauthorized:
             fail("access_token 已失效（401 Unauthorized），本次不再等待。请重新登录 2libra.com 抓取新 token 并更新。", 2)
+        except CloudflareBlocked as e:
+            fail("被 Cloudflare 拦截（HTTP %s），本次不再等待。HTTP 指纹为「%s」，需更换执行环境。" % (e.status, http_backend()), 3)
         except Exception as e:
             print("[计划] 预检请求异常（不影响后续签到）：%s" % e)
         print("[等待] 开始等待 %s，预计 %s 执行签到……" % (fmt_dur(delay), target_at.strftime("%H:%M:%S")))
@@ -747,6 +838,12 @@ def main():
             acct, stats, txn = f_acct.result(), f_stats.result(), f_txn.result()
     except Unauthorized:
         fail("access_token 已失效（401 Unauthorized）。请重新登录 2libra.com 抓取新的 token 并更新。", 2)
+    except CloudflareBlocked as e:
+        fail("被 Cloudflare 拦截（HTTP %s）：返回的是机器人挑战页而非接口数据，说明当前出口 IP 不受信任。"
+             "本次 HTTP 指纹为「%s」。若这里已是 curl_cffi 的 Chrome 模拟，说明该机房 IP 被重点盯防，"
+             "建议改用其它执行环境（自建 runner / 国内云函数 / 本机）；若显示 urllib，"
+             "请检查 workflow 里安装 curl_cffi 的步骤是否被跳过。"
+             % (e.status, http_backend()), 3)
 
     v = collect(sign_ok, sign_resp, acct, stats, txn, args.check)
     text = render(v)
