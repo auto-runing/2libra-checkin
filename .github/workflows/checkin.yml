@@ -33,12 +33,6 @@ on:
     - cron: "5,15,25,35,45,55 0-3 * * *"
   # 网页 / 手机 GitHub App 手动点一下即可立即签到（不参与抽签）
   workflow_dispatch:
-  # 临时：推送改动即自动跑一次，便于验证修复效果（验证完会移除）
-  push:
-    paths:
-      - "checkin.py"
-      - "schedule.json"
-      - ".github/workflows/checkin.yml"
 
 permissions:
   contents: write
