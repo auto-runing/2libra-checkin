@@ -1,0 +1,74 @@
+name: 2Libra 每日签到
+
+# ===========================================================================
+#  签到时刻怎么配（对应 schedule.json 里的 mode）
+#
+#  ── 模式 A：时段抽签 slot（当前默认，推荐）─────────────────────────────
+#      cron 每 10 分钟触发一次，脚本每天抽一个目标时刻（基准 + 1~3 小时随机），
+#      只有「到点」的那一次真正签到，其余各次几秒钟就退出、不请求任何接口。
+#      随机的是**任务启动时刻本身**，作业不会空等，Actions 分钟数省约 30 倍。
+#      代价：每天约 24 次很短的任务运行；时间精度取决于 cron 间隔（默认 10 分钟）。
+#
+#  ── 模式 B：作业内等待 sleep ───────────────────────────────────────────
+#      cron 只触发一次，脚本在作业里随机等 1~3 小时再签到。时间精度最高，
+#      但等待时间真实计入 Actions 分钟数（约 3600 分钟/月，私有仓库会超额）。
+#      启用方式：把下面 schedule 换成单条 cron，并把 schedule.json 的 mode 改 "sleep"。
+#          - cron: "5 0 * * *"        # 00:05 UTC = 北京 08:05
+#
+#  时区换算（cron 用 UTC，北京 = UTC + 8）：
+#      北京 06:00 -> "0 22 * * *"      北京 08:05 -> "5 0 * * *"
+#      北京 12:00 -> "0 4 * * *"       北京 20:00 -> "0 12 * * *"
+#
+#  改了基准时间，务必同步改 schedule.json 的 base_time（不一致时日志会告警）。
+# ===========================================================================
+
+on:
+  schedule:
+    # slot 模式：UTC 00:05/00:15/…/03:55 触发，即北京 08:05 ~ 11:55
+    # 覆盖「基准 08:05 + 随机 60~180 分钟」的全部可能落点，并留了兜底时段
+    - cron: "5,15,25,35,45,55 0-3 * * *"
+  # 网页 / 手机 GitHub App 手动点一下即可立即签到（不参与抽签）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: 2libra-checkin
+  cancel-in-progress: false    # 抽签模式下不要互相打断
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    # 仅 sleep 模式需要长超时（必须大于 delay_max_minutes）；slot 模式用不满
+    timeout-minutes: 350
+    steps:
+      - name: 拉取仓库
+        uses: actions/checkout@v4
+
+      - name: 执行签到（按抽签结果决定是否执行）
+        env:
+          TWOLIBRA_TOKEN: ${{ secrets.TWOLIBRA_TOKEN }}
+          TWOLIBRA_COOKIE: ${{ secrets.TWOLIBRA_COOKIE }}
+          PUSH_URL: ${{ secrets.PUSH_URL }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          # 触发本次运行的 cron 原文与事件名；脚本据此判断是否参与抽签
+          SCHEDULED_CRON: ${{ github.event.schedule }}
+          # 想不改文件就调整随机区间，可解开下面两行（单位：分钟）
+          # TWOLIBRA_DELAY_MIN: "0"
+          # TWOLIBRA_DELAY_MAX: "60"
+        # 脚本是纯标准库，直接用 runner 自带的 python3，省掉 setup-python 的时间
+        run: python3 checkin.py --notify
+
+      - name: 保活心跳（有签到记录时才提交，规避 60 天无提交被自动禁用）
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain logs)" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -A logs
+            git commit -m "chore: 签到记录 $(date -u '+%Y-%m-%d')"
+            git push
+          else
+            echo "本次无签到记录变更，跳过提交"
+          fi
