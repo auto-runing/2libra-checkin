@@ -60,6 +60,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import ssl
 import sys
 import time
@@ -173,7 +174,8 @@ def fail(msg, code=1):
     line = "[%s] 失败: %s" % (now_str(), msg)
     print(line)
     write_log(line)
-    push_notice("2Libra 签到失败", line, warning=True)
+    # 推送里单独带时间，保持消息本身干净
+    push_notice("2Libra 签到失败", "%s\n%s" % (now_str(), msg), warning=True)
     sys.exit(code)
 
 
@@ -699,6 +701,57 @@ def render_markdown(v):
 
 
 # --------------------------------------------------------------------------- #
+# 手机推送（统一纯文本：无 markdown 符号、无链接）
+# --------------------------------------------------------------------------- #
+RULE = "─" * 14          # 分隔线，手机聊天里比等号/星号干净
+MAX_PUSH_CHARS = 1200    # 企微 text 类型上限约 2048 字节，留足余量
+
+_LINK_RE = re.compile(r"https?://\S+")
+
+
+def strip_links(text):
+    """推送内容里不出现链接：微信/企微会把 URL 变成可点链接，这里一律替换掉。"""
+    return _LINK_RE.sub("（链接已省略）", str(text)).strip()
+
+
+def _token_days_left(exp_left):
+    """从「2026-11-16 06:50（剩 36 天）」里取出天数；解析失败返回 None。"""
+    try:
+        return int(exp_left.split("剩 ")[1].split(" ")[0])
+    except Exception:
+        return None
+
+
+def render_text(v):
+    """手机推送用的纯文本消息：统一「两字标签：值」的排版，无符号、无链接。"""
+    ok = v["sign_ok"] and "失败" not in str(v["sign_state"])
+    out = ["2Libra 每日签到 " + ("✅" if ok else "⚠️"), RULE]
+
+    def add(label, value):
+        if value not in (None, ""):
+            out.append("%s：%s" % (label, value))
+
+    add("账号", v["account"] or "-")
+    add("结果", v["sign_state"])
+    add("奖励", v["reward"])
+    if v["streak"] is not None:
+        tail = "（历史最长 %s 天）" % v["max_streak"] if v["max_streak"] is not None else ""
+        add("连签", "%s 天%s" % (v["streak"], tail))
+    add("金币", v["coins"])
+    add("等级", str(v["level"]).replace("  ", " ") if v["level"] else "")
+    add("检定", v["check"])
+    if v["attrs"]:
+        add("属性", " ｜ ".join(v["attrs"]))
+    if v["exp_left"]:
+        days = _token_days_left(v["exp_left"])
+        add("凭据", v["exp_left"] + ("　请尽快更换" if days is not None and days < 7 else ""))
+
+    out.append(RULE)
+    out.append(str(v["time"]))
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------- #
 # 手机推送
 # --------------------------------------------------------------------------- #
 def http_post_json(url, payload, timeout=15):
@@ -709,24 +762,28 @@ def http_post_json(url, payload, timeout=15):
 
 
 def push_notice(title, content, warning=False):
-    """散装文本推送（用于异常提示）。"""
-    body = "> <font color=\"%s\">%s</font>\n\n> %s" % (
-        "warning" if warning else "info", title, content.replace("\n", "\n> "))
+    """异常提示推送（纯文本）。"""
+    body = "\n".join([title + (" ⚠️" if warning else ""), RULE, str(content).strip()])
     _do_push(body, title)
 
 
 def push_result(v):
-    _do_push(render_markdown(v), "2Libra 每日签到")
+    # 手机推送用纯文本；GitHub 任务摘要在网页上渲染，仍用 markdown 排版
+    _do_push(render_text(v), "2Libra 每日签到", render_markdown(v))
 
 
-def _do_push(markdown_body, title):
+def _do_push(text_body, title, md_body=None):
+    """发到手机：企业微信走 text 类型、PushPlus 走 txt 模板，统一纯文本、不含链接。"""
+    body = strip_links(text_body)
+    if len(body) > MAX_PUSH_CHARS:
+        body = body[:MAX_PUSH_CHARS] + "\n（内容过长已截断）"
     sent = False
 
     url = (os.environ.get("PUSH_URL") or "").strip()
     if url:
         try:
-            st, body = http_post_json(url, {"msgtype": "markdown", "markdown": {"content": markdown_body}})
-            print("[通知] 企业微信 -> HTTP %s %s" % (st, body[:200]))
+            st, resp = http_post_json(url, {"msgtype": "text", "text": {"content": body}})
+            print("[通知] 企业微信 -> HTTP %s %s" % (st, resp[:200]))
             sent = True
         except Exception as e:
             print("[通知] 企业微信发送失败: %s" % e)
@@ -734,10 +791,10 @@ def _do_push(markdown_body, title):
     pp = (os.environ.get("PUSHPLUS_TOKEN") or "").strip()
     if pp:
         try:
-            st, body = http_post_json("https://www.pushplus.plus/send",
-                                      {"token": pp, "title": title, "content": markdown_body,
-                                       "template": "markdown"})
-            print("[通知] PushPlus -> HTTP %s %s" % (st, body[:200]))
+            st, resp = http_post_json("https://www.pushplus.plus/send",
+                                      {"token": pp, "title": title, "content": body,
+                                       "template": "txt"})
+            print("[通知] PushPlus -> HTTP %s %s" % (st, resp[:200]))
             sent = True
         except Exception as e:
             print("[通知] PushPlus 发送失败: %s" % e)
@@ -749,7 +806,7 @@ def _do_push(markdown_body, title):
     if summary_file:
         try:
             with open(summary_file, "a", encoding="utf-8") as f:
-                f.write("## 2Libra 每日签到\n\n" + markdown_body + "\n")
+                f.write("## %s\n\n" % title + strip_links(md_body or body) + "\n")
             print("[通知] 已写入 GitHub 任务摘要。")
         except Exception as e:
             print("[通知] 写入任务摘要失败: %s" % e)
@@ -820,7 +877,7 @@ def main():
             get_account(cfg)
             print("[计划] 凭据预检通过，token 有效。")
         except Unauthorized:
-            fail("access_token 已失效（401 Unauthorized），本次不再等待。请重新登录 2libra.com 抓取新 token 并更新。", 2)
+            fail("access_token 已失效（401 Unauthorized），本次不再等待。请重新登录 2Libra 网站抓取新 token 并更新。", 2)
         except CloudflareBlocked as e:
             fail("被 Cloudflare 拦截（HTTP %s），本次不再等待。HTTP 指纹为「%s」，需更换执行环境。" % (e.status, http_backend()), 3)
         except Exception as e:
@@ -837,7 +894,7 @@ def main():
             f_txn = pool.submit(get_today_checkin_txn, cfg)
             acct, stats, txn = f_acct.result(), f_stats.result(), f_txn.result()
     except Unauthorized:
-        fail("access_token 已失效（401 Unauthorized）。请重新登录 2libra.com 抓取新的 token 并更新。", 2)
+        fail("access_token 已失效（401 Unauthorized）。请重新登录 2Libra 网站抓取新的 token 并更新。", 2)
     except CloudflareBlocked as e:
         fail("被 Cloudflare 拦截（HTTP %s）：返回的是机器人挑战页而非接口数据，说明当前出口 IP 不受信任。"
              "本次 HTTP 指纹为「%s」。若这里已是 curl_cffi 的 Chrome 模拟，说明该机房 IP 被重点盯防，"
