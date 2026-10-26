@@ -53,6 +53,7 @@ git push -u origin main
 | Name | 是否必须 | 说明 |
 | --- | --- | --- |
 | `TWOLIBRA_TOKEN` | **必须** | 浏览器里抓的 Bearer token，**不要**带 `Bearer ` 前缀 |
+| `PAT` | 选填（推荐） | GitHub Personal Access Token，用于把签到日志推回仓库；不配则回退默认 `GITHUB_TOKEN`，详见下文「3.5 配置 PAT」 |
 | `PUSH_URL` | 选填 | 企业微信群机器人 Webhook，用于推送到手机 |
 | `PUSHPLUS_TOKEN` | 选填 | PushPlus token，推送到微信 |
 | `TWOLIBRA_COOKIE` | 选填 | 一般不需要 |
@@ -60,6 +61,32 @@ git push -u origin main
 抓 `TWOLIBRA_TOKEN`：登录 2libra.com → `F12` → **Network** → 筛 `Fetch/XHR` → 刷新页面 →
 点任一 `2libra.com/api/...` 请求 → **Request Headers** 里的
 `authorization: Bearer eyJ...`，复制 `Bearer ` 后面那段。
+
+### 3.5（选填）配置 PAT：让日志推送更可靠
+
+签到日志默认由 GitHub 自带的 `GITHUB_TOKEN` 推回仓库，开箱即用。
+如果想让推送**更稳、归属更清晰**，可以再配一个 PAT（Personal Access Token）：
+
+| | 默认 `GITHUB_TOKEN` | PAT |
+| --- | --- | --- |
+| 权限来源 | 跟随仓库 Settings → Actions → General → **Workflow permissions**；被设成只读时推送会 403 失败 | 权限长在 token 自己身上，勾了 Contents 读写就不受该设置影响 |
+| 推送身份 | 提交显示为 `github-actions[bot]` | 等同你本人推送，通知、贡献记录正常 |
+| 触发其他工作流 | 不会（GitHub 防递归设计，本项目目前用不到） | 会（等同一次普通 push） |
+| 配置成本 | 零 | 一次性创建 token |
+
+**申请 PAT（二选一）：**
+
+- **细粒度 token（推荐）**：打开 <https://github.com/settings/tokens?type=beta> →
+  **Generate new token** → **Repository access** 选 `Only select repositories` 并勾选你的签到仓库 →
+  **Repository permissions** 把 **Contents** 设为 `Read and write`（Metadata 只读自带）→
+  拉到底 **Generate token** → **马上复制**（关掉页面后就看不到完整 token 了）
+- **经典 token**：打开 <https://github.com/settings/tokens> → 勾选 `repo` scope → 生成后复制
+
+**存入 Secret**：仓库 → **Settings → Secrets and variables → Actions → New repository secret**，
+Name 填 `PAT`，Secret 粘贴刚才的 token → Add secret。
+
+> 不配 `PAT` 完全能跑：工作流会自动回退到默认 `GITHUB_TOKEN`。
+> PAT 泄露或失效了就重新生成一个、更新 `PAT` Secret，不用改任何文件。
 
 ### 4. 手动测试一次
 
@@ -253,10 +280,12 @@ python checkin.py --delay-seconds 5  # 手动指定等待秒数（调试用）
   手工点「Run workflow」时可正常看到输出，不用担心被超时打断。
 - **定时任务可能延迟几分钟**，高峰期（UTC 整点）尤其明显。所以 `slot` 模式的 cron
   刻意从 **08:05** 起步而不是整点；也因为如此，`slot` 模式的时间精度不要指望到分钟级。
-- **60 天无提交，定时任务会被 GitHub 自动禁用**。本仓库的「保活心跳」步骤在
-  每次**成功签到**后提交一次 `logs/last-signed.txt`（未到点的那些触发不会产生提交，
-  所以不会一天刷 24 个 commit），以此规避。不想要这些提交就删掉该 step，
-  但要记得每两个月手动点一次 Run workflow。
+- **60 天无提交，定时任务会被 GitHub 自动禁用**（该规则仅针对**公开**仓库；
+  按本文档部署的私有仓库不受影响，但「保活心跳」仍会把日志留档在仓库里）。
+  本仓库的「保活心跳」步骤在每次**成功签到**后把 `logs/` 目录的变更
+  （`last-signed.txt` 与当月日志 `checkin-YYYY-MM.log`）提交回仓库
+  （未到点的那些触发不会产生提交，所以不会一天刷 24 个 commit），以此规避。
+  不想要这些提交就删掉该 step，但要记得每两个月手动点一次 Run workflow。
 - **token 有效期 60 天**，到期后签到会失败并推送一条 `401` 告警到手机，
   按上面的方法重新抓一个，更新 `TWOLIBRA_TOKEN` Secret 即可。
 - 签到是**幂等**的：当天重复运行只会返回「今天已经签到过了」，不会重复发币。

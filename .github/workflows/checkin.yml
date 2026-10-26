@@ -49,6 +49,12 @@ jobs:
     steps:
       - name: 拉取仓库
         uses: actions/checkout@v4
+        with:
+          # secrets.PAT（选填）：配了就用 PAT 推送签到日志——等同本人推送，
+          # 不受仓库 Workflow permissions 只读设置影响；未配置则回退默认
+          # GITHUB_TOKEN（依赖下面的 permissions: contents: write）。
+          # PAT 申请方法见 README「三、部署步骤 → 3.5 配置 PAT」。
+          token: ${{ secrets.PAT || github.token }}
 
       - name: 缓存指纹依赖
         uses: actions/cache@v4
@@ -85,6 +91,8 @@ jobs:
 
       - name: 保活心跳（有签到记录时才提交，规避 60 天无提交被自动禁用）
         if: always()
+        # 推送身份 = 「拉取仓库」持久化的凭据：配了 secrets.PAT 就是 PAT，
+        # 否则是默认 GITHUB_TOKEN（需 permissions: contents: write 且仓库允许写）。
         run: |
           if [ -n "$(git status --porcelain logs)" ]; then
             git config user.name  "github-actions[bot]"
